@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { wouldCreateCycle } from "./departments/hierarchy.js";
+import { DEFAULT_AUTHORITY, MANAGER_AUTHORITY } from "./employees/authority.js";
 import { assertGoalTransition, canTransitionGoal } from "./goals/transitions.js";
 import { assertProjectTransition, canTransitionProject } from "./projects/transitions.js";
-import { assertWorkItemTransition, canTransitionWorkItem } from "./work/transitions.js";
-import { buildWorkItemIdempotencyKey, normalizeTitle } from "./work/duplicate-detection.js";
-import { wouldCreateCycle } from "./departments/hierarchy.js";
 import { validateSopDefinition } from "./sop/validation.js";
-import { DEFAULT_AUTHORITY, MANAGER_AUTHORITY } from "./employees/authority.js";
+import { buildWorkItemIdempotencyKey, normalizeTitle } from "./work/duplicate-detection.js";
+import { assertWorkItemTransition, canTransitionWorkItem } from "./work/transitions.js";
 
 describe("WorkItem transitions", () => {
   it("allows backlog->ready->assigned->in_progress->completed", () => {
@@ -67,14 +67,49 @@ describe("duplicate detection", () => {
     expect(normalizeTitle("  Hello   World ")).toBe("hello world");
   });
   it("builds deterministic key", () => {
-    const k1 = buildWorkItemIdempotencyKey({ workspaceId: "w1", projectId: "p1", title: "Build landing page", source: "manual" });
-    const k2 = buildWorkItemIdempotencyKey({ workspaceId: "w1", projectId: "p1", title: "  build LANDING page ", source: "manual" });
+    const k1 = buildWorkItemIdempotencyKey({
+      workspaceId: "w1",
+      projectId: "p1",
+      title: "Build landing page",
+      source: "manual",
+    });
+    const k2 = buildWorkItemIdempotencyKey({
+      workspaceId: "w1",
+      projectId: "p1",
+      title: "  build LANDING page ",
+      source: "manual",
+    });
     expect(k1).toBe(k2);
   });
   it("different project yields different key", () => {
-    const k1 = buildWorkItemIdempotencyKey({ workspaceId: "w1", projectId: "p1", title: "Task", source: "manual" });
-    const k2 = buildWorkItemIdempotencyKey({ workspaceId: "w1", projectId: "p2", title: "Task", source: "manual" });
+    const k1 = buildWorkItemIdempotencyKey({
+      workspaceId: "w1",
+      projectId: "p1",
+      title: "Task",
+      source: "manual",
+    });
+    const k2 = buildWorkItemIdempotencyKey({
+      workspaceId: "w1",
+      projectId: "p2",
+      title: "Task",
+      source: "manual",
+    });
     expect(k1).not.toBe(k2);
+  });
+  it("does not collide when components contain the old separator", () => {
+    const first = buildWorkItemIdempotencyKey({
+      workspaceId: "a|b",
+      projectId: "c",
+      title: "Task",
+      source: "manual",
+    });
+    const second = buildWorkItemIdempotencyKey({
+      workspaceId: "a",
+      projectId: "b|c",
+      title: "Task",
+      source: "manual",
+    });
+    expect(first).not.toBe(second);
   });
 });
 
@@ -101,9 +136,27 @@ describe("department hierarchy cycle", () => {
 
 describe("SOP validation", () => {
   it("validates trigger and steps", () => {
-    expect(() => validateSopDefinition({ trigger: "", conditions: [], steps: [{ type: "create_work", instruction: "Do it" }] } as never)).toThrow();
-    expect(() => validateSopDefinition({ trigger: "github.issue.created", conditions: [], steps: [] } as never)).toThrow();
-    expect(() => validateSopDefinition({ trigger: "github.issue.created", conditions: [], steps: [{ type: "create_work", instruction: "Triage" }] } as never)).not.toThrow();
+    expect(() =>
+      validateSopDefinition({
+        trigger: "",
+        conditions: [],
+        steps: [{ type: "create_work", instruction: "Do it" }],
+      } as never),
+    ).toThrow();
+    expect(() =>
+      validateSopDefinition({
+        trigger: "github.issue.created",
+        conditions: [],
+        steps: [],
+      } as never),
+    ).toThrow();
+    expect(() =>
+      validateSopDefinition({
+        trigger: "github.issue.created",
+        conditions: [],
+        steps: [{ type: "create_work", instruction: "Triage" }],
+      } as never),
+    ).not.toThrow();
   });
 });
 

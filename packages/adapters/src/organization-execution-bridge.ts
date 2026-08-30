@@ -45,7 +45,10 @@ export function createOrganizationExecutionBridge(deps: {
         where: { workItemId: workItem.id, status: { in: ACTIVE_EXECUTION_STATUSES } },
         select: { runId: true },
       });
-      if (active) return { runId: active.runId, created: false };
+      if (active) {
+        await deps.jobs.enqueue(runContinueJob(active.runId));
+        return { runId: active.runId, created: false };
+      }
 
       const bot = await deps.prisma.bot.findFirst({
         where: { id: workItem.assignedToBotId, workspaceId: input.workspaceId, archivedAt: null },
@@ -119,7 +122,7 @@ export function createOrganizationExecutionBridge(deps: {
         });
         return { runId: run.id, created: true };
       });
-      if (created?.created) await deps.jobs.enqueue(runContinueJob(created.runId));
+      if (created) await deps.jobs.enqueue(runContinueJob(created.runId));
       return created;
     },
 
@@ -129,11 +132,14 @@ export function createOrganizationExecutionBridge(deps: {
           id: input.reviewId,
           workspaceId: input.workspaceId,
           status: "pending",
-          runId: null,
         },
         include: { workItem: { include: { project: true } } },
       });
       if (!review?.reviewerBotId || review.workItem.status !== "waiting_review") return null;
+      if (review.runId) {
+        await deps.jobs.enqueue(runContinueJob(review.runId));
+        return { runId: review.runId };
+      }
       const bot = await deps.prisma.bot.findFirst({
         where: { id: review.reviewerBotId, workspaceId: input.workspaceId, archivedAt: null },
         include: { thread: true, employeeProfile: true },
@@ -292,47 +298,54 @@ export function createOrganizationExecutionBridge(deps: {
         include: { workItem: true },
       });
       if (!execution) return this.finalizeReview(input);
-      const settled = await deps.prisma.workItemExecution.updateMany({
-        where: { id: execution.id, status: { in: ACTIVE_EXECUTION_STATUSES } },
-        data: {
-          status: input.outcome,
-          result: (input.blocks ? { blocks: input.blocks } : {}) as never,
-          error: input.error ?? null,
-          completedAt: new Date(),
-        },
-      });
-      if (settled.count !== 1) return false;
-
-      if (input.outcome === "completed") {
-        if (execution.workItem.reviewerBotId) {
-          const review = await deps.prisma.workItemReview.create({
-            data: {
-              workspaceId: execution.workspaceId,
-              workItemId: execution.workItemId,
-              reviewerBotId: execution.workItem.reviewerBotId,
-              status: "pending",
-              summary: "Execution completed; review requested.",
-            },
-          });
-          await deps.prisma.workItem.updateMany({
-            where: {
-              id: execution.workItemId,
-              workspaceId: execution.workspaceId,
-              status: "in_progress",
-            },
-            data: { status: "waiting_review" },
-          });
-          await deps.prisma.companyEvent.create({
-            data: {
-              workspaceId: execution.workspaceId,
-              type: "review.requested",
-              workItemId: execution.workItemId,
-              payload: { reviewId: review.id, runId: input.runId } as never,
-            },
-          });
-          await deps.jobs.enqueue(workItemReviewJob(execution.workspaceId, review.id));
-        } else {
-          await deps.prisma.workItem.updateMany({
+      const lifecycle = await deps.prisma.$transaction(async (tx) => {
+        // Terminal execution state and every durable lifecycle effect commit together.
+        const settled = await tx.workItemExecution.updateMany({
+          where: { id: execution.id, status: { in: ACTIVE_EXECUTION_STATUSES } },
+          data: {
+            status: input.outcome,
+            result: (input.blocks ? { blocks: input.blocks } : {}) as never,
+            error: input.error ?? null,
+            completedAt: new Date(),
+          },
+        });
+        if (settled.count !== 1) return null;
+        const projectId = execution.workItem.projectId;
+        if (input.outcome === "completed") {
+          if (execution.workItem.reviewerBotId) {
+            const review = await tx.workItemReview.create({
+              data: {
+                workspaceId: execution.workspaceId,
+                workItemId: execution.workItemId,
+                reviewerBotId: execution.workItem.reviewerBotId,
+                status: "pending",
+                summary: "Execution completed; review requested.",
+              },
+            });
+            await tx.workItem.updateMany({
+              where: {
+                id: execution.workItemId,
+                workspaceId: execution.workspaceId,
+                status: "in_progress",
+              },
+              data: { status: "waiting_review" },
+            });
+            await tx.companyEvent.create({
+              data: {
+                workspaceId: execution.workspaceId,
+                type: "review.requested",
+                workItemId: execution.workItemId,
+                payload: { reviewId: review.id, runId: input.runId } as never,
+              },
+            });
+            return {
+              reviewId: review.id,
+              projectId,
+              wakeBotId: null as string | null,
+              retryAt: null as Date | null,
+            };
+          }
+          await tx.workItem.updateMany({
             where: {
               id: execution.workItemId,
               workspaceId: execution.workspaceId,
@@ -340,7 +353,7 @@ export function createOrganizationExecutionBridge(deps: {
             },
             data: { status: "completed" },
           });
-          await deps.prisma.companyEvent.create({
+          await tx.companyEvent.create({
             data: {
               workspaceId: execution.workspaceId,
               type: "work.completed",
@@ -348,74 +361,66 @@ export function createOrganizationExecutionBridge(deps: {
               payload: { runId: input.runId } as never,
             },
           });
+          return {
+            reviewId: null as string | null,
+            projectId,
+            wakeBotId: null as string | null,
+            retryAt: null as Date | null,
+          };
         }
-        if (execution.workItem.projectId) {
-          await deps.jobs.enqueue(
-            projectEvaluateJob(execution.workspaceId, execution.workItem.projectId),
-          );
-        }
-        return true;
-      }
 
-      const retry = execution.attempt < maxAttempts;
-      await deps.prisma.workItem.updateMany({
-        where: {
-          id: execution.workItemId,
-          workspaceId: execution.workspaceId,
-          status: "in_progress",
-        },
-        data: { status: "failed" },
-      });
-      await deps.prisma.companyEvent.create({
-        data: {
-          workspaceId: execution.workspaceId,
-          type: "work.failed",
-          workItemId: execution.workItemId,
-          payload: { runId: input.runId, attempt: execution.attempt, retry } as never,
-        },
-      });
-      if (retry && execution.workItem.assignedToBotId) {
-        // Preserve the domain lifecycle: a failed attempt becomes actionable
-        // again through failed → ready, then the employee atomically claims it.
-        await deps.prisma.workItem.updateMany({
+        const retry =
+          execution.attempt < maxAttempts && Boolean(execution.workItem.assignedToBotId);
+        await tx.workItem.updateMany({
           where: {
             id: execution.workItemId,
             workspaceId: execution.workspaceId,
-            status: "failed",
+            status: "in_progress",
           },
-          data: { status: "ready" },
+          data: { status: retry ? "ready" : "failed" },
         });
-        const backoffMs = 5_000 * 2 ** (execution.attempt - 1);
-        await deps.jobs.enqueue(
-          employeeWakeupJob(
-            execution.workspaceId,
-            execution.workItem.assignedToBotId,
-            "execution_retry",
-            new Date(Date.now() + backoffMs),
-          ),
-        );
-      } else if (!retry) {
-        const existingEscalation = await deps.prisma.escalation.findFirst({
+        await tx.companyEvent.create({
+          data: {
+            workspaceId: execution.workspaceId,
+            type: "work.failed",
+            workItemId: execution.workItemId,
+            payload: { runId: input.runId, attempt: execution.attempt, retry } as never,
+          },
+        });
+        if (retry) {
+          return {
+            reviewId: null as string | null,
+            projectId,
+            wakeBotId: execution.workItem.assignedToBotId,
+            retryAt: new Date(Date.now() + 5_000 * 2 ** (execution.attempt - 1)),
+          };
+        }
+        const source = execution.workItem.assignedToBotId ?? "system";
+        const existing = await tx.escalation.findFirst({
           where: {
             workspaceId: execution.workspaceId,
-            sourceBotId: execution.workItem.assignedToBotId ?? "",
+            sourceBotId: source,
             workItemId: execution.workItemId,
             status: "open",
           },
         });
-        if (!existingEscalation) {
-          const source = execution.workItem.assignedToBotId;
-          const profile = source
-            ? await deps.prisma.employeeProfile.findFirst({
-                where: { workspaceId: execution.workspaceId, botId: source },
+        let targetBotId: string | null = existing?.targetBotId ?? null;
+        if (!existing) {
+          const profile = execution.workItem.assignedToBotId
+            ? await tx.employeeProfile.findFirst({
+                where: {
+                  workspaceId: execution.workspaceId,
+                  botId: execution.workItem.assignedToBotId,
+                },
                 select: { reportsToBotId: true },
               })
             : null;
-          const escalation = await deps.prisma.escalation.create({
+          targetBotId = profile?.reportsToBotId ?? null;
+          const escalation = await tx.escalation.create({
             data: {
               workspaceId: execution.workspaceId,
-              sourceBotId: source ?? "system",
-              targetBotId: profile?.reportsToBotId ?? null,
+              sourceBotId: source,
+              targetBotId,
               workItemId: execution.workItemId,
               reason: "WorkItem execution retries exhausted.",
               severity: "high",
@@ -426,29 +431,37 @@ export function createOrganizationExecutionBridge(deps: {
               } as never,
             },
           });
-          await deps.prisma.companyEvent.create({
+          await tx.companyEvent.create({
             data: {
               workspaceId: execution.workspaceId,
               type: "escalation.created",
               workItemId: execution.workItemId,
               escalationId: escalation.id,
-              payload: { targetBotId: escalation.targetBotId } as never,
+              payload: { targetBotId } as never,
             },
           });
-          if (escalation.targetBotId)
-            await deps.jobs.enqueue(
-              employeeWakeupJob(
-                execution.workspaceId,
-                escalation.targetBotId,
-                "execution_retry_exhausted",
-              ),
-            );
         }
-        if (execution.workItem.projectId)
-          await deps.jobs.enqueue(
-            projectEvaluateJob(execution.workspaceId, execution.workItem.projectId),
-          );
-      }
+        return {
+          reviewId: null as string | null,
+          projectId,
+          wakeBotId: targetBotId,
+          retryAt: null as Date | null,
+        };
+      });
+      if (!lifecycle) return false;
+      if (lifecycle.reviewId)
+        await deps.jobs.enqueue(workItemReviewJob(execution.workspaceId, lifecycle.reviewId));
+      if (lifecycle.wakeBotId)
+        await deps.jobs.enqueue(
+          employeeWakeupJob(
+            execution.workspaceId,
+            lifecycle.wakeBotId,
+            lifecycle.retryAt ? "execution_retry" : "execution_retry_exhausted",
+            lifecycle.retryAt ?? undefined,
+          ),
+        );
+      if (lifecycle.projectId)
+        await deps.jobs.enqueue(projectEvaluateJob(execution.workspaceId, lifecycle.projectId));
       return true;
     },
 

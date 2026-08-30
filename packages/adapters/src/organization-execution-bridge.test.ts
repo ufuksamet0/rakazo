@@ -75,6 +75,13 @@ describe("OrganizationExecutionBridge", () => {
   });
 
   it("settles a successful unreviewed execution exactly once", async () => {
+    const tx = {
+      workItemExecution: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      workItem: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      companyEvent: { create: vi.fn(async () => undefined) },
+      workItemReview: { findFirst: vi.fn(async () => null) },
+      escalation: { findFirst: vi.fn(async () => null) },
+    };
     const prisma = {
       workItemExecution: {
         findUnique: vi.fn(async () => ({
@@ -84,10 +91,8 @@ describe("OrganizationExecutionBridge", () => {
           attempt: 1,
           workItem: { reviewerBotId: null, assignedToBotId: "dev" },
         })),
-        updateMany: vi.fn(async () => ({ count: 1 })),
       },
-      workItem: { updateMany: vi.fn(async () => ({ count: 1 })) },
-      companyEvent: { create: vi.fn(async () => undefined) },
+      $transaction: vi.fn(async (fn: (value: typeof tx) => unknown) => fn(tx)),
     } as unknown as PrismaClient;
     const jobs = { enqueue: vi.fn(async () => undefined) } as unknown as JobPublisher;
 
@@ -98,7 +103,7 @@ describe("OrganizationExecutionBridge", () => {
         blocks: [{ kind: "text", text: "done" }],
       }),
     ).resolves.toBe(true);
-    expect(prisma.workItem.updateMany).toHaveBeenCalledWith(
+    expect(tx.workItem.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: { status: "completed" } }),
     );
   });

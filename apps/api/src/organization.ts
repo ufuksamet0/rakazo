@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import { employeeWakeupJob, type JobPublisher } from "@rakazo/adapter-kit";
 import type { Actor } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
 import { IsolationError } from "@rakazo/db";
@@ -257,40 +258,36 @@ export async function createEmployeeProfile(
     if (input.reportsToBotId === input.botId)
       throw new ORPCError("BAD_REQUEST", { message: "Cannot report to self" });
   }
-  await prisma.employeeProfile.create({
-    data: {
-      workspaceId: actor.workspaceId,
-      botId: input.botId,
-      departmentId: input.departmentId ?? null,
-      reportsToBotId: input.reportsToBotId ?? null,
-      role: input.role ?? "employee",
-      mission: input.mission ?? "",
-      responsibilities: (input.responsibilities ?? []) as never,
-      authority: (input.authority ?? {}) as never,
-      autonomyLevel: input.autonomyLevel ?? "standard",
-      workMode: input.workMode ?? "standard",
-    },
-    include: { runtime: true },
-  });
-  // create runtime state
-  await prisma.employeeRuntimeState.create({
-    data: {
-      workspaceId: actor.workspaceId,
-      botId: input.botId,
-      status: "idle",
-    },
-  });
-  await prisma.companyEvent.create({
-    data: {
-      workspaceId: actor.workspaceId,
-      type: "employee.created",
-      actorBotId: input.botId,
-      payload: {} as never,
-    },
-  });
-  const withRuntime = await prisma.employeeProfile.findUnique({
-    where: { botId: input.botId },
-    include: { runtime: true },
+  const withRuntime = await prisma.$transaction(async (tx) => {
+    await tx.employeeProfile.create({
+      data: {
+        workspaceId: actor.workspaceId,
+        botId: input.botId,
+        departmentId: input.departmentId ?? null,
+        reportsToBotId: input.reportsToBotId ?? null,
+        role: input.role ?? "employee",
+        mission: input.mission ?? "",
+        responsibilities: (input.responsibilities ?? []) as never,
+        authority: (input.authority ?? {}) as never,
+        autonomyLevel: input.autonomyLevel ?? "standard",
+        workMode: input.workMode ?? "standard",
+      },
+    });
+    await tx.employeeRuntimeState.create({
+      data: { workspaceId: actor.workspaceId, botId: input.botId, status: "idle" },
+    });
+    await tx.companyEvent.create({
+      data: {
+        workspaceId: actor.workspaceId,
+        type: "employee.created",
+        actorBotId: input.botId,
+        payload: {} as never,
+      },
+    });
+    return tx.employeeProfile.findUnique({
+      where: { botId: input.botId },
+      include: { runtime: true },
+    });
   });
   return employeeRow(withRuntime as never);
 }
@@ -987,28 +984,46 @@ export async function delegateWorkItem(
       }
     }
   }
-  const child = await prisma.workItem.create({
-    data: {
-      workspaceId: actor.workspaceId,
-      title: input.title.trim(),
-      description: input.description ?? "",
-      projectId: parent.projectId,
-      parentWorkItemId: parent.id,
-      priority: parent.priority,
-      status: "assigned",
-      assignedToBotId: input.assignedToBotId,
-      source: "delegation",
-      expectedOutcome: input.expectedOutcome ?? "",
-      idempotencyKey: buildWorkItemIdempotencyKey({
-        workspaceId: actor.workspaceId,
-        projectId: parent.projectId ?? undefined,
-        parentWorkItemId: parent.id,
-        title: input.title,
-        source: "delegation",
-      }),
-      metadata: { parentWorkItemId: parent.id } as never,
-    },
+  const idempotencyKey = buildWorkItemIdempotencyKey({
+    workspaceId: actor.workspaceId,
+    projectId: parent.projectId ?? undefined,
+    parentWorkItemId: parent.id,
+    title: input.title,
+    source: "delegation",
   });
+  const existing = await prisma.workItem.findUnique({ where: { idempotencyKey } });
+  if (existing) {
+    if (existing.workspaceId !== actor.workspaceId || existing.parentWorkItemId !== parent.id) {
+      throw new ORPCError("CONFLICT", { message: "Work item idempotency key already exists" });
+    }
+    return workItemRow(existing);
+  }
+  let child: Awaited<ReturnType<typeof prisma.workItem.create>>;
+  try {
+    child = await prisma.workItem.create({
+      data: {
+        workspaceId: actor.workspaceId,
+        title: input.title.trim(),
+        description: input.description ?? "",
+        projectId: parent.projectId,
+        parentWorkItemId: parent.id,
+        priority: parent.priority,
+        status: "assigned",
+        assignedToBotId: input.assignedToBotId,
+        source: "delegation",
+        expectedOutcome: input.expectedOutcome ?? "",
+        idempotencyKey,
+        metadata: { parentWorkItemId: parent.id } as never,
+      },
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const duplicate = await prisma.workItem.findUnique({ where: { idempotencyKey } });
+    if (duplicate?.workspaceId === actor.workspaceId && duplicate.parentWorkItemId === parent.id) {
+      return workItemRow(duplicate);
+    }
+    throw new ORPCError("CONFLICT", { message: "Work item idempotency key already exists" });
+  }
   await prisma.companyEvent.create({
     data: {
       workspaceId: actor.workspaceId,
@@ -1018,6 +1033,15 @@ export async function delegateWorkItem(
     },
   });
   return workItemRow(child);
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: string }).code === "P2002"
+  );
 }
 
 // ── Reviews ──
@@ -1121,33 +1145,37 @@ export async function completeReview(
   if (!existing) throw new ORPCError("NOT_FOUND", { message: "Review not found" });
   if (existing.status !== "pending")
     throw new ORPCError("CONFLICT", { message: "Review has already been completed" });
-  const row = await prisma.workItemReview.update({
-    where: { id: input.reviewId },
-    data: {
-      status: input.status,
-      ...(input.summary !== undefined ? { summary: input.summary } : {}),
-      ...(input.feedback !== undefined ? { feedback: input.feedback } : {}),
-      completedAt: new Date(),
-    },
-  });
-  // Update work item status based on review
   const wi = await prisma.workItem.findUnique({ where: { id: existing.workItemId } });
-  if (wi) {
-    if (wi.workspaceId !== actor.workspaceId) throw new IsolationError();
-    if (wi.status !== "waiting_review" && wi.status !== "reviewing") {
-      throw new ORPCError("BAD_REQUEST", { message: "WorkItem is not awaiting this review" });
-    }
+  if (!wi) throw new ORPCError("NOT_FOUND", { message: "WorkItem not found" });
+  if (wi.workspaceId !== actor.workspaceId) throw new IsolationError();
+  if (wi.status !== "waiting_review" && wi.status !== "reviewing") {
+    throw new ORPCError("BAD_REQUEST", { message: "WorkItem is not awaiting this review" });
+  }
+  const row = await prisma.$transaction(async (tx) => {
+    const row = await tx.workItemReview.update({
+      where: { id: input.reviewId },
+      data: {
+        status: input.status,
+        ...(input.summary !== undefined ? { summary: input.summary } : {}),
+        ...(input.feedback !== undefined ? { feedback: input.feedback } : {}),
+        completedAt: new Date(),
+      },
+    });
     if (input.status === "approved") {
-      await prisma.workItem.update({ where: { id: wi.id }, data: { status: "completed" } });
-      await prisma.companyEvent.create({
-        data: {
-          workspaceId: actor.workspaceId,
-          type: "review.completed",
-          workItemId: wi.id,
-          payload: { reviewId: row.id, status: "approved" } as never,
-        },
-      });
-      await prisma.companyEvent.create({
+      await tx.workItem.update({ where: { id: wi.id }, data: { status: "completed" } });
+    } else if (input.status === "changes_requested") {
+      await tx.workItem.update({ where: { id: wi.id }, data: { status: "in_progress" } });
+    }
+    await tx.companyEvent.create({
+      data: {
+        workspaceId: actor.workspaceId,
+        type: "review.completed",
+        workItemId: wi.id,
+        payload: { reviewId: row.id, status: input.status } as never,
+      },
+    });
+    if (input.status === "approved") {
+      await tx.companyEvent.create({
         data: {
           workspaceId: actor.workspaceId,
           type: "work.completed",
@@ -1155,27 +1183,9 @@ export async function completeReview(
           payload: {} as never,
         },
       });
-    } else if (input.status === "changes_requested") {
-      await prisma.workItem.update({ where: { id: wi.id }, data: { status: "in_progress" } });
-      await prisma.companyEvent.create({
-        data: {
-          workspaceId: actor.workspaceId,
-          type: "review.completed",
-          workItemId: wi.id,
-          payload: { reviewId: row.id, status: "changes_requested" } as never,
-        },
-      });
-    } else {
-      await prisma.companyEvent.create({
-        data: {
-          workspaceId: actor.workspaceId,
-          type: "review.completed",
-          workItemId: wi.id,
-          payload: { reviewId: row.id, status: "cancelled" } as never,
-        },
-      });
     }
-  }
+    return row;
+  });
   return reviewRow(row);
 }
 
@@ -1463,7 +1473,12 @@ export async function listCompanyEvents(prisma: PrismaClient, actor: Actor, limi
   }));
 }
 
-export async function wakeEmployee(prisma: PrismaClient, actor: Actor, botId: string) {
+export async function wakeEmployee(
+  prisma: PrismaClient,
+  jobs: JobPublisher,
+  actor: Actor,
+  botId: string,
+) {
   const profile = await prisma.employeeProfile.findFirst({
     where: { botId, workspaceId: actor.workspaceId },
   });
@@ -1490,5 +1505,6 @@ export async function wakeEmployee(prisma: PrismaClient, actor: Actor, botId: st
       payload: {} as never,
     },
   });
+  await jobs.enqueue(employeeWakeupJob(actor.workspaceId, botId, "manual_wakeup"));
   return { ok: true as const };
 }

@@ -24,7 +24,7 @@ export function buildWorkItemIdempotencyKey(input: {
     input.source ?? "manual",
     input.sourceEventId ?? "",
   ];
-  return parts.join("|");
+  return JSON.stringify(parts);
 }
 
 export function isDuplicateTitle(existingTitles: string[], candidate: string): boolean {

@@ -499,7 +499,7 @@ export function createRouter(deps: RouterDeps) {
           removeEmployee(deps.prisma, context.actor, input.botId),
         ),
         wake: authed.organization.employees.wake.handler(({ context, input }) =>
-          wakeEmployee(deps.prisma, context.actor, input.botId),
+          wakeEmployee(deps.prisma, deps.jobs, context.actor, input.botId),
         ),
       },
       goals: {

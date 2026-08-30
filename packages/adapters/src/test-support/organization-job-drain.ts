@@ -1,7 +1,7 @@
 import {
-  dispatchBackgroundJob,
   type BackgroundJob,
   type BackgroundJobHandlers,
+  dispatchBackgroundJob,
   type JobPublisher,
 } from "@rakazo/adapter-kit";
 
@@ -30,20 +30,23 @@ export class DeterministicOrganizationJobQueue implements JobPublisher {
 
   async close(): Promise<void> {}
 
-  get size() { return this.queued.length; }
+  get size() {
+    return this.queued.length;
+  }
 
   async drain(handlers: BackgroundJobHandlers, options: { maxJobs?: number; now?: Date } = {}) {
     const maxJobs = options.maxJobs ?? 100;
     let processed = 0;
     while (this.queued.length > 0) {
       if (processed >= maxJobs) {
-        throw new Error(`Organization job drain exceeded ${maxJobs} jobs: ${this.trace.map((item) => item.name).join(" → ")}`);
+        throw new Error(
+          `Organization job drain exceeded ${maxJobs} jobs: ${this.trace.map((item) => item.name).join(" → ")}`,
+        );
       }
-      const job = this.queued.shift()!;
-      if (job.availableAt && job.availableAt > (options.now ?? new Date())) {
-        this.queued.unshift(job);
-        break;
-      }
+      const now = options.now ?? new Date();
+      const index = this.queued.findIndex((item) => !item.availableAt || item.availableAt <= now);
+      if (index < 0) break;
+      const job = this.queued.splice(index, 1)[0]!;
       this.trace.push({ name: job.name, payload: job.payload });
       await dispatchBackgroundJob(handlers, job.name, job.payload);
       processed += 1;

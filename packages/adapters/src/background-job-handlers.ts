@@ -9,7 +9,10 @@ import type {
 } from "@rakazo/adapter-kit";
 import { phoneDeliverJob, workItemDispatchJob } from "@rakazo/adapter-kit";
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
-import { acquireEmployeeEvaluationLease, releaseEmployeeEvaluationLease } from "@rakazo/organization";
+import {
+  acquireEmployeeEvaluationLease,
+  releaseEmployeeEvaluationLease,
+} from "@rakazo/organization";
 import { expireComputerControl } from "./computer-control.js";
 import { scheduleComputerSleep, sleepComputerIfIdle } from "./computer-idle.js";
 import type { createRunExecutor } from "./executor.js";
@@ -101,29 +104,33 @@ export function createBackgroundJobHandlers(deps: {
         now,
       });
       if (!lease) return;
-      const workItem = await deps.prisma.workItem.findFirst({
-        where: {
-          workspaceId: payload.workspaceId,
-          assignedToBotId: payload.botId,
-          status: { in: ["ready", "assigned", "planning", "in_progress"] },
-        },
-        orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-        select: { id: true },
-      });
-      if (workItem) {
-        await deps.prisma.workItem.updateMany({
-          where: { id: workItem.id, workspaceId: payload.workspaceId, status: "ready" },
-          data: { status: "assigned" },
+      let workItem: { id: string } | null = null;
+      try {
+        workItem = await deps.prisma.workItem.findFirst({
+          where: {
+            workspaceId: payload.workspaceId,
+            assignedToBotId: payload.botId,
+            status: { in: ["ready", "assigned", "planning", "in_progress"] },
+          },
+          orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+          select: { id: true },
         });
-        await deps.jobs.enqueue(workItemDispatchJob(payload.workspaceId, workItem.id));
+        if (workItem) {
+          await deps.prisma.workItem.updateMany({
+            where: { id: workItem.id, workspaceId: payload.workspaceId, status: "ready" },
+            data: { status: "assigned" },
+          });
+          await deps.jobs.enqueue(workItemDispatchJob(payload.workspaceId, workItem.id));
+        }
+      } finally {
+        await releaseEmployeeEvaluationLease(deps.prisma, {
+          workspaceId: payload.workspaceId,
+          botId: payload.botId,
+          lease,
+          status: workItem ? "working" : "sleeping",
+          nextWakeAt: workItem ? null : new Date(now.getTime() + 30_000),
+        });
       }
-      await releaseEmployeeEvaluationLease(deps.prisma, {
-        workspaceId: payload.workspaceId,
-        botId: payload.botId,
-        lease,
-        status: workItem ? "working" : "sleeping",
-        nextWakeAt: workItem ? null : new Date(now.getTime() + 30_000),
-      });
     },
     "employee.evaluate": async () => undefined,
     "manager.evaluate": async (payload) => {

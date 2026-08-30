@@ -140,8 +140,14 @@ async function main() {
     jobs,
     events,
     onRunFinalized: async (input) => {
-      await organizationBridge.finalize(input);
-      await managerRuntime.finalize(input);
+      const results = await Promise.allSettled([
+        organizationBridge.finalize(input),
+        managerRuntime.finalize(input),
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected")
+          console.error("organization run finalization failed", result.reason);
+      }
     },
     onRunPausedForApproval: (input) => organizationBridge.markWaitingApproval(input),
     onRunResumed: (input) => organizationBridge.markExecutionResumed(input),

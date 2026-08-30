@@ -203,7 +203,9 @@ export async function createApp(
   await connector.start();
   void stack.composio?.warmDirectory().catch(() => undefined);
   void pipedream?.warmDirectory?.().catch(() => undefined);
-  const runtime = runtimeOverride ?? (env.agentRuntime === "scripted" ? new ScriptedAgentRuntime() : new PiAgentRuntime());
+  const runtime =
+    runtimeOverride ??
+    (env.agentRuntime === "scripted" ? new ScriptedAgentRuntime() : new PiAgentRuntime());
   const notifications = new ExpoPushProvider(env.dataDir);
   const auth = createAuth(prisma, {
     secret: env.authSecret,
@@ -267,8 +269,14 @@ export async function createApp(
     jobs,
     events,
     onRunFinalized: async (input) => {
-      await organizationBridge.finalize(input);
-      await managerRuntime.finalize(input);
+      const results = await Promise.allSettled([
+        organizationBridge.finalize(input),
+        managerRuntime.finalize(input),
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected")
+          console.error("organization run finalization failed", result.reason);
+      }
     },
     onRunPausedForApproval: (input) => organizationBridge.markWaitingApproval(input),
     onRunResumed: (input) => organizationBridge.markExecutionResumed(input),
