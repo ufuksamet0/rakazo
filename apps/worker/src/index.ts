@@ -7,6 +7,9 @@ import {
   createBackgroundJobHandlers,
   createConnectorStack,
   createJobReconciler,
+  createOrganizationExecutionBridge,
+  createOrganizationManagerRuntime,
+  createOrganizationProgressEvaluator,
   createPhoneContextLoader,
   createPostgresReconciliationLeadership,
   createRunExecutor,
@@ -115,6 +118,9 @@ async function main() {
   const inMemoryJobs = process.env.WAKEUP_DRIVER === "memory" ? new InMemoryJobQueue() : undefined;
   const jobs: JobPublisher = inMemoryJobs ?? new GraphileJobPublisher(databaseUrl);
   const jobHost: JobWorkerHost = inMemoryJobs ?? new GraphileJobWorkerHost(databaseUrl);
+  const organizationBridge = createOrganizationExecutionBridge({ prisma, jobs });
+  const managerRuntime = createOrganizationManagerRuntime({ prisma, jobs });
+  const progressEvaluator = createOrganizationProgressEvaluator({ prisma, jobs });
   const executor = createRunExecutor({
     prisma,
     runtime,
@@ -133,6 +139,18 @@ async function main() {
     notifications: new ExpoPushProvider(dataDir),
     jobs,
     events,
+    onRunFinalized: async (input) => {
+      const results = await Promise.allSettled([
+        organizationBridge.finalize(input),
+        managerRuntime.finalize(input),
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected")
+          console.error("organization run finalization failed", result.reason);
+      }
+    },
+    onRunPausedForApproval: (input) => organizationBridge.markWaitingApproval(input),
+    onRunResumed: (input) => organizationBridge.markExecutionResumed(input),
     phone: messaging ? createPhoneContextLoader(prisma) : undefined,
   });
 
@@ -148,6 +166,9 @@ async function main() {
     secretStore: secrets,
     memoryProviders,
     deploymentModelKey,
+    organizationBridge,
+    managerRuntime,
+    progressEvaluator,
     messaging,
   });
   await jobHost.start(jobHandlers);

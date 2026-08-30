@@ -3,6 +3,8 @@ import { rm } from "node:fs/promises";
 import { ORPCError, onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type {
+  AgentRuntime,
+  BackgroundJobHandlers,
   JobPublisher,
   ManagedConnectorProvider,
   MessagingProvider,
@@ -16,6 +18,9 @@ import {
   createBackgroundJobHandlers,
   createConnectorStack,
   createJobReconciler,
+  createOrganizationExecutionBridge,
+  createOrganizationManagerRuntime,
+  createOrganizationProgressEvaluator,
   createPhoneContextLoader,
   createRunExecutor,
   createRunSandbox,
@@ -77,6 +82,7 @@ export interface AppHandles {
   connectors: ConnectorRegistry;
   messaging?: MessagingProvider;
   executor: ReturnType<typeof createRunExecutor>;
+  jobHandlers: BackgroundJobHandlers;
   stop: () => Promise<void>;
 }
 
@@ -88,6 +94,8 @@ export async function createApp(
     pipedream?: ManagedConnectorProvider;
     messaging?: MessagingProvider;
     remoteConnectors?: RemoteConnectorDependencies;
+    runtime?: AgentRuntime;
+    jobs?: JobPublisher;
   } = {},
 ): Promise<AppHandles> {
   const {
@@ -97,6 +105,8 @@ export async function createApp(
     pipedream: pipedreamOverride,
     messaging: messagingOverride,
     remoteConnectors,
+    runtime: runtimeOverride,
+    jobs: jobsOverride,
     ...envOverrides
   } = overrides;
   const env = { ...loadEnv(process.env), ...envOverrides };
@@ -143,8 +153,8 @@ export async function createApp(
   }
 
   const jobKind = env.wakeupDriver;
-  const inMemoryJobs = jobKind === "memory" ? new InMemoryJobQueue() : undefined;
-  const jobs = inMemoryJobs ?? new GraphileJobPublisher(env.databaseUrl);
+  const inMemoryJobs = !jobsOverride && jobKind === "memory" ? new InMemoryJobQueue() : undefined;
+  const jobs = jobsOverride ?? inMemoryJobs ?? new GraphileJobPublisher(env.databaseUrl);
   const sandbox: SandboxProvider = createRunSandbox(env.sandboxProvider, {
     supervisorUrl: env.sandboxSupervisorUrl,
     supervisorToken: env.sandboxSupervisorToken,
@@ -194,7 +204,8 @@ export async function createApp(
   void stack.composio?.warmDirectory().catch(() => undefined);
   void pipedream?.warmDirectory?.().catch(() => undefined);
   const runtime =
-    env.agentRuntime === "scripted" ? new ScriptedAgentRuntime() : new PiAgentRuntime();
+    runtimeOverride ??
+    (env.agentRuntime === "scripted" ? new ScriptedAgentRuntime() : new PiAgentRuntime());
   const notifications = new ExpoPushProvider(env.dataDir);
   const auth = createAuth(prisma, {
     secret: env.authSecret,
@@ -236,6 +247,9 @@ export async function createApp(
       await rm(pushTokenPath(env.dataDir, userId), { force: true }).catch(() => undefined);
     },
   });
+  const organizationBridge = createOrganizationExecutionBridge({ prisma, jobs });
+  const managerRuntime = createOrganizationManagerRuntime({ prisma, jobs });
+  const progressEvaluator = createOrganizationProgressEvaluator({ prisma, jobs });
   const executor = createRunExecutor({
     prisma,
     runtime,
@@ -254,6 +268,18 @@ export async function createApp(
     notifications,
     jobs,
     events,
+    onRunFinalized: async (input) => {
+      const results = await Promise.allSettled([
+        organizationBridge.finalize(input),
+        managerRuntime.finalize(input),
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected")
+          console.error("organization run finalization failed", result.reason);
+      }
+    },
+    onRunPausedForApproval: (input) => organizationBridge.markWaitingApproval(input),
+    onRunResumed: (input) => organizationBridge.markExecutionResumed(input),
     phone: messaging ? createPhoneContextLoader(prisma) : undefined,
   });
 
@@ -269,6 +295,9 @@ export async function createApp(
     secretStore: secrets,
     memoryProviders,
     deploymentModelKey: env.deploymentModelKey,
+    organizationBridge,
+    managerRuntime,
+    progressEvaluator,
     messaging,
   });
   if (inMemoryJobs) {
@@ -411,6 +440,7 @@ export async function createApp(
     connectors: stack.connector,
     messaging,
     executor,
+    jobHandlers,
     stop: async () => {
       oauthLogins.abortAll();
       await reconciler?.stop();
